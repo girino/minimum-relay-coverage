@@ -7,12 +7,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
@@ -25,6 +27,14 @@ type RelayInfo struct {
 	Pubkeys    []string
 }
 
+// Global variables for the flags
+var (
+	ignoreOnion            bool
+	ignoreNonTLS           bool
+	ignoreLocal            bool
+	ignoreNonStandardPorts bool
+)
+
 func main() {
 	// Parse command-line arguments
 	flag.Usage = func() {
@@ -33,8 +43,6 @@ func main() {
 	}
 
 	var help bool
-	var ignoreOnion bool
-	var ignoreNonTLS bool
 	var defaultRelaysFile string
 	var ignoreRelaysFile string
 	var coverTimes int
@@ -44,6 +52,8 @@ func main() {
 	flag.BoolVar(&help, "help", false, "Show usage information")
 	flag.BoolVar(&ignoreOnion, "ignore-onion", false, "Ignore relays with .onion domains")
 	flag.BoolVar(&ignoreNonTLS, "ignore-non-tls", false, "Ignore non-TLS relays (ws://)")
+	flag.BoolVar(&ignoreLocal, "ignore-local", false, "Ignore local addresses (.local, .lan, private IP ranges)")
+	flag.BoolVar(&ignoreNonStandardPorts, "ignore-non-standard-ports", false, "Ignore relay URLs with non-standard ports")
 	flag.StringVar(&defaultRelaysFile, "default-relays-file", "", "Path to file containing default relays")
 	flag.StringVar(&ignoreRelaysFile, "ignore-relays-file", "", "Path to file containing ignored relays")
 	flag.IntVar(&coverTimes, "cover-times", 2, "Number of times each pubkey should be covered (must be >= 1)")
@@ -117,10 +127,13 @@ func main() {
 	}
 
 	// Normalize and validate the initial relays
-	initialRelays = filterRelays(initialRelays, ignoreNonTLS)
+	initialRelays = filterRelays(initialRelays)
 	var validInitialRelays []string
 	for _, relayURL := range initialRelays {
 		normalizedRelay := normalizeRelayURL(relayURL)
+		if normalizedRelay == "" {
+			continue // Skip invalid URLs
+		}
 		if isValidRelayURL(normalizedRelay) {
 			validInitialRelays = append(validInitialRelays, normalizedRelay)
 		}
@@ -142,9 +155,12 @@ func main() {
 
 	// Normalize and validate the ignore relays
 	normalizedIgnoreRelays := make(map[string]bool)
-	ignoreRelays = filterRelays(ignoreRelays, ignoreNonTLS)
+	ignoreRelays = filterRelays(ignoreRelays)
 	for _, relay := range ignoreRelays {
 		normalizedRelay := normalizeRelayURL(relay)
+		if normalizedRelay == "" {
+			continue // Skip invalid URLs
+		}
 		if isValidRelayURL(normalizedRelay) {
 			normalizedIgnoreRelays[normalizedRelay] = true
 		}
@@ -204,7 +220,7 @@ func main() {
 		}
 
 		// Get relays for the batch of pubkeys
-		relaysForBatch, err := getRelaysForPubkeys(ctx, relayPool, validBatchPubkeys, initialRelays, ignoreNonTLS)
+		relaysForBatch, err := getRelaysForPubkeys(ctx, relayPool, validBatchPubkeys, initialRelays)
 		if err != nil {
 			log.Printf("Error getting relays for batch: %v", err)
 			bar.Add(1)
@@ -216,8 +232,12 @@ func main() {
 		for pk, relays := range relaysForBatch {
 			validRelays := []string{}
 			for _, relay := range relays {
-				if isValidRelayURL(relay) {
-					validRelays = append(validRelays, relay)
+				normalizedRelay := normalizeRelayURL(relay)
+				if normalizedRelay == "" {
+					continue // Skip invalid URLs
+				}
+				if isValidRelayURL(normalizedRelay) {
+					validRelays = append(validRelays, normalizedRelay)
 				}
 			}
 			pubkeyRelays[pk] = validRelays
@@ -233,27 +253,15 @@ func main() {
 	for pk, relays := range pubkeyRelays {
 		for _, relay := range relays {
 			normalizedRelay := normalizeRelayURL(relay)
+			if normalizedRelay == "" {
+				continue // Skip invalid URLs
+			}
 			if !isValidRelayURL(normalizedRelay) {
 				continue // Skip invalid relay URLs
 			}
 			if normalizedIgnoreRelays[normalizedRelay] {
 				// Skip relays in the ignore list
 				continue
-			}
-			if ignoreOnion {
-				// Parse the relay URL to check for .onion domains
-				parsedURL, err := url.Parse(normalizedRelay)
-				if err == nil && strings.HasSuffix(parsedURL.Hostname(), ".onion") {
-					// Skip .onion domains if ignoreOnion is true
-					continue
-				}
-			}
-			if ignoreNonTLS {
-				// Skip non-TLS relays if ignoreNonTLS is true
-				parsedURL, err := url.Parse(normalizedRelay)
-				if err == nil && parsedURL.Scheme != "wss" {
-					continue
-				}
 			}
 			if _, ok := relayPubkeys[normalizedRelay]; !ok {
 				relayPubkeys[normalizedRelay] = make(map[string]bool)
@@ -382,19 +390,30 @@ func readRelaysFromFile(filename string) ([]string, error) {
 	return relays, nil
 }
 
-func filterRelays(relays []string, ignoreNonTLS bool) []string {
+func filterRelays(relays []string) []string {
 	var filtered []string
 	for _, relay := range relays {
-		if ignoreNonTLS {
-			parsedURL, err := url.Parse(relay)
-			if err != nil {
-				continue // Skip invalid URLs
-			}
-			if parsedURL.Scheme != "wss" {
-				continue // Skip non-TLS relays
-			}
+		normalizedRelay := normalizeRelayURL(relay)
+		if normalizedRelay == "" {
+			continue // Skip invalid URLs
 		}
-		filtered = append(filtered, relay)
+		parsedURL, err := url.Parse(normalizedRelay)
+		if err != nil {
+			continue // Skip invalid URLs
+		}
+		if ignoreNonTLS && parsedURL.Scheme != "wss" {
+			continue // Skip non-TLS relays
+		}
+		if ignoreOnion && strings.HasSuffix(parsedURL.Hostname(), ".onion") {
+			continue // Skip .onion relays
+		}
+		if ignoreLocal && isLocalAddress(parsedURL.Hostname()) {
+			continue // Skip local addresses
+		}
+		if ignoreNonStandardPorts && !isStandardPort(parsedURL) {
+			continue // Skip non-standard ports
+		}
+		filtered = append(filtered, normalizedRelay)
 	}
 	return filtered
 }
@@ -431,9 +450,12 @@ func normalizeRelayURL(relay string) string {
 	// Parse the URL
 	parsedURL, err := url.Parse(relay)
 	if err != nil {
-		// If parsing fails, return the original relay URL
-		return relay
+		// If parsing fails, return an empty string to indicate invalid URL
+		return ""
 	}
+
+	// Remove duplicate slashes in the path
+	parsedURL.Path = strings.ReplaceAll(parsedURL.Path, "//", "/")
 
 	// Remove trailing slashes from the path
 	parsedURL.Path = strings.TrimRight(parsedURL.Path, "/")
@@ -453,7 +475,82 @@ func isValidRelayURL(relay string) bool {
 	if parsedURL.Host == "" {
 		return false
 	}
+
+	// Ensure that there is no double slash in the host or path
+	if strings.Contains(parsedURL.Host, "//") || strings.Contains(parsedURL.Path, "//") {
+		return false
+	}
+
+	// Validate the host using net package
+	host := parsedURL.Hostname()
+	if net.ParseIP(host) == nil && !isValidDomain(host) {
+		return false
+	}
+
+	if ignoreLocal && isLocalAddress(host) {
+		return false
+	}
+
+	if ignoreOnion && strings.HasSuffix(host, ".onion") {
+		return false
+	}
+
+	if ignoreNonTLS && parsedURL.Scheme != "wss" {
+		return false
+	}
+
+	if ignoreNonStandardPorts && !isStandardPort(parsedURL) {
+		return false
+	}
+
 	return true
+}
+
+func isValidDomain(domain string) bool {
+	// Simple domain validation (can be improved)
+	// Ensure the domain contains only allowed characters and at least one dot
+	if len(domain) == 0 || !strings.Contains(domain, ".") {
+		return false
+	}
+	for _, c := range domain {
+		if !(unicode.IsLetter(c) || unicode.IsDigit(c) || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func isLocalAddress(host string) bool {
+	// Check for TLDs .local and .lan
+	if strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".lan") {
+		return true
+	}
+
+	// Try to parse the host as an IP address
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Not an IP address
+		return false
+	}
+
+	// Check if IP is in private or loopback ranges
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	return false
+}
+
+func isStandardPort(parsedURL *url.URL) bool {
+	port := parsedURL.Port()
+	if port == "" {
+		// No port specified; default port is assumed
+		return true
+	}
+	if (parsedURL.Scheme == "wss" && port == "443") || (parsedURL.Scheme == "ws" && port == "80") {
+		return true
+	}
+	return false
 }
 
 func getFollowsFromKind3Batch(ctx context.Context, relayPool *nostr.SimplePool, pubkeys []string, initialRelays []string) ([]string, error) {
@@ -530,7 +627,7 @@ func getFollowsFromKind3Batch(ctx context.Context, relayPool *nostr.SimplePool, 
 	return follows, nil
 }
 
-func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubkeys []string, initialRelays []string, ignoreNonTLS bool) (map[string][]string, error) {
+func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubkeys []string, initialRelays []string) (map[string][]string, error) {
 	// Prepare the filter
 	filter := nostr.Filter{
 		Authors: pubkeys,
@@ -578,14 +675,8 @@ OuterLoop:
 				for _, tag := range ev.Event.Tags {
 					if tag[0] == "r" && len(tag) > 1 {
 						normalizedRelay := normalizeRelayURL(tag[1])
-						if ignoreNonTLS {
-							parsedURL, err := url.Parse(normalizedRelay)
-							if err != nil {
-								continue // Skip invalid URLs
-							}
-							if parsedURL.Scheme != "wss" {
-								continue // Skip non-TLS relays
-							}
+						if normalizedRelay == "" {
+							continue // Skip invalid URLs
 						}
 						if !isValidRelayURL(normalizedRelay) {
 							continue // Skip invalid relay URLs
