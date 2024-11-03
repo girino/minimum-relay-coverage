@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Nostr Relay Finder</title>
+    <style>
+body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        input[type="text"] {
+            width: 80%;
+            padding: 10px;
+            font-size: 16px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            margin-left: 10px;
+            cursor: pointer;
+        }
+        div#output {
+            background-color: #fff;
+            padding: 20px;
+            border: 1px solid #ddd;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+.loading {
+            color: #007BFF;
+        }
+        .error {
+            color: #DC3545;
+        }
+    </style>
+</head>
+<body>
+    <h1>Nostr Relay Finder</h1>
+    <p>Enter your Nostr public key (npub format):</p>
+    <input type="text" id="pubkey" placeholder="npub1..." />
+    <button id="findRelays">Find Relays</button>
+    <div id="output"></div>
+
+    <!-- Use a module script to import nostr-tools from Skypack -->
+    <script type="module">
+        import { relayInit, nip19 } from 'https://cdn.skypack.dev/nostr-tools@1.8.2';
+
+        document.getElementById('findRelays').addEventListener('click', async () => {
+            const npub = document.getElementById('pubkey').value.trim();
+            const output = document.getElementById('output');
+            output.textContent = 'Processing...';
+            output.className = 'loading';
+
+            try {
+                // Decode npub to hex pubkey
+                const decoded = nip19.decode(npub);
+                if (decoded.type !== 'npub') {
+                    throw new Error('Invalid npub format.');
+                }
+                const pubkeyHex = decoded.data;
+
+                // Define the list of relays to query
+                const relays = [
+                    'wss://relay.damus.io',
+                    'wss://relay.snort.social',
+                    'wss://nostr.mom',
+                ].map(normalizeRelayURL);
+
+                // Fetch contacts (kind 3 events)
+                const contacts = await fetchContacts(pubkeyHex, relays);
+
+                if (contacts.length === 0) {
+                    output.textContent = 'No contacts found for this pubkey.';
+                    output.className = '';
+                    return;
+                }
+
+                // Fetch relays for contacts (kind 10002 events)
+                const relayContactMap = await fetchRelaysForContacts(contacts, relays);
+                
+                if (relayContactMap.size === 0) {
+                    output.textContent = 'No relays found for contacts.';
+                    output.className = '';
+                    return;
+                }
+
+                // Determine the minimum relay set
+                const minRelaySet = computeMinimumRelaySet(relayContactMap, contacts);
+
+                // Display the results
+                output.className = '';
+                if (minRelaySet.length === 0) {
+                    output.textContent = 'No relays needed to cover all contacts.';
+                } else {
+                    let tableHTML = 'Minimum relay set:<br><br>';
+                    tableHTML += '<table border="1"><thead><tr><th>Relay</th><th>Coverage</th></tr></thead><tbody>';
+                    minRelaySet.forEach((relay) => {
+                        const coveredContacts = relayContactMap.get(relay).size;
+                        tableHTML += `<tr><td>${relay}</td><td style="text-align: right;">${coveredContacts}</td></tr>`;
+                    });
+                    tableHTML += '</tbody></table>';
+                    output.innerHTML = tableHTML;
+
+                }
+            } catch (error) {
+                output.textContent = `Error: ${error.message}`;
+                output.className = 'error';
+            }
+        });
+
+        /**
+         * Fetch contacts (kind 3 events) for a given pubkey from specified relays.
+         * @param {string} pubkey - Hexadecimal pubkey.
+         * @param {string[]} relays - List of relay URLs.
+         * @returns {Promise<string[]>} - List of contact pubkeys.
+         */
+        async function fetchContacts(pubkey, relays) {
+            const contacts = new Set();
+
+            for (const relayUrl of relays) {
+                try {
+                    const relay = relayInit(relayUrl);
+                    await relay.connect();
+
+                    const sub = relay.sub([
+                        {
+                            kinds: [3],
+                            authors: [pubkey],
+                        },
+                    ]);
+
+                    await new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => {
+                            sub.unsub();
+                            relay.close();
+                            resolve();
+                        }, 5000); // 5-second timeout per relay
+
+                        sub.on('event', (event) => {
+                            // Parse 'p' tags for contacts
+                            event.tags.forEach((tag) => {
+                                if (tag[0] === 'p' && tag[1]) {
+                                    contacts.add(tag[1]);
+                                }
+                            });
+                        });
+
+                        sub.on('eose', () => {
+                            clearTimeout(timeout);
+                            sub.unsub();
+                            relay.close();
+                            resolve();
+                        });
+
+                        sub.on('error', (err) => {
+                            clearTimeout(timeout);
+                            sub.unsub();
+                            relay.close();
+                            console.error(`Error on relay ${relayUrl}:`, err);
+                            resolve(); // Continue even if there's an error
+                        });
+                    });
+                } catch (err) {
+                    console.error(`Failed to fetch contacts from ${relayUrl}:`, err);
+                }
+            }
+
+            return Array.from(contacts);
+        }
+
+        /**
+         * Fetch relays (kind 10002 events) for a list of contacts from specified relays.
+         * @param {string[]} contacts - List of contact pubkeys.
+         * @param {string[]} relays - List of relay URLs.
+         * @returns {Promise<Map<string, Set<string>>>} - Map of relay URLs to sets of contact pubkeys they cover.
+         */
+        async function fetchRelaysForContacts(contacts, relays) {
+            const relayContactMap = new Map();
+
+            for (const relayUrl of relays) {
+                try {
+                    const relay = relayInit(relayUrl);
+                    await relay.connect();
+
+                    const sub = relay.sub([
+                        {
+                            kinds: [10002],
+                            authors: contacts,
+                        },
+                    ]);
+
+                    await new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => {
+                            sub.unsub();
+                            relay.close();
+                            resolve();
+                        }, 5000); // 5-second timeout per relay
+
+                        sub.on('event', (event) => {
+                            event.tags.forEach((tag) => {
+                                if (tag[0] === 'r' && tag[1]) {
+                                    const normalizedRelay = normalizeRelayURL(tag[1]);
+                                    if (!relayContactMap.has(normalizedRelay)) {
+                                        relayContactMap.set(normalizedRelay, new Set());
+                                    }
+                                    if (event.pubkey) {
+                                        relayContactMap.get(normalizedRelay).add(event.pubkey);
+                                    }
+                                }
+                            });
+                        });
+
+                        sub.on('eose', () => {
+                            clearTimeout(timeout);
+                            sub.unsub();
+                            relay.close();
+                            resolve();
+                        });
+
+                        sub.on('error', (err) => {
+                            clearTimeout(timeout);
+                            sub.unsub();
+                            relay.close();
+                            console.error(`Error on relay ${relayUrl}:`, err);
+                            resolve(); // Continue even if there's an error
+                        });
+                    });
+                } catch (err) {
+                    console.error(`Failed to fetch relays from ${relayUrl}:`, err);
+                }
+            }
+
+                        return relayContactMap;
+        }
+
+        /**
+         * Compute the minimum set of relays needed to cover all contacts using a greedy algorithm.
+         * @param {Map<string, Set<string>>} relayContactMap - A map of relay URLs to the set of contacts they cover.
+         * @param {string[]} contacts - List of contact pubkeys that need to be covered.
+         * @returns {string[]} - Minimum relay set.
+         */
+        function computeMinimumRelaySet(relayContactMap, contacts) {
+            const contactsToCover = new Set(contacts);
+            const selectedRelays = [];
+
+            while (contactsToCover.size > 0) {
+                let bestRelay = null;
+                let maxCoveredContacts = 0;
+
+                relayContactMap.forEach((coveredContacts, relay) => {
+                    const uncoveredContacts = new Set(
+                        [...coveredContacts].filter((c) => contactsToCover.has(c))
+                    );
+                    if (uncoveredContacts.size > maxCoveredContacts) {
+                        bestRelay = relay;
+                        maxCoveredContacts = uncoveredContacts.size;
+                    }
+                });
+
+                if (bestRelay === null) {
+                    break;
+                }
+
+                selectedRelays.push(bestRelay);
+                relayContactMap.get(bestRelay).forEach((c) => contactsToCover.delete(c));
+                // relayContactMap.delete(bestRelay);
+            }
+
+            return selectedRelays;
+        }
+
+        /**
+         * Normalize relay URL to avoid duplicates caused by trailing slashes.
+         * @param {string} url - Relay URL to normalize.
+         * @returns {string} - Normalized relay URL.
+         */
+        function normalizeRelayURL(url) {
+            try {
+                const parsedUrl = new URL(url);
+                parsedUrl.pathname = parsedUrl.pathname.replace(/\/+/g, '/').replace(/\/$/, '');
+                return parsedUrl.toString();
+            } catch (e) {
+                console.error(`Failed to normalize URL: ${url}`, e);
+                return url;
+            }
+        }
+    </script>
+</body>
+</html>
