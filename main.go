@@ -9,34 +9,49 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/schollz/progressbar/v3"
 )
+
+type RelayInfo struct {
+	Relay      string
+	NumPubkeys int
+	Pubkeys    []string
+}
 
 func main() {
 	// Parse command-line arguments
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <pubkey>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] [<pubkey>]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 
 	var help bool
 	var ignoreOnion bool
+	var ignoreNonTLS bool
 	var defaultRelaysFile string
 	var ignoreRelaysFile string
 	var coverTimes int
+	var pubkeysFile string
+	var verbose bool
 
 	flag.BoolVar(&help, "help", false, "Show usage information")
 	flag.BoolVar(&ignoreOnion, "ignore-onion", false, "Ignore relays with .onion domains")
+	flag.BoolVar(&ignoreNonTLS, "ignore-non-tls", false, "Ignore non-TLS relays (ws://)")
 	flag.StringVar(&defaultRelaysFile, "default-relays-file", "", "Path to file containing default relays")
 	flag.StringVar(&ignoreRelaysFile, "ignore-relays-file", "", "Path to file containing ignored relays")
 	flag.IntVar(&coverTimes, "cover-times", 2, "Number of times each pubkey should be covered (must be >= 1)")
+	flag.StringVar(&pubkeysFile, "pubkeys-file", "", "Path to file containing pubkeys")
+	flag.BoolVar(&verbose, "verbose", false, "Print detailed relay coverage information")
 	flag.Parse()
 
-	if help || flag.NArg() != 1 {
+	if help || (flag.NArg() == 0 && pubkeysFile == "") {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -45,11 +60,39 @@ func main() {
 		log.Fatalf("Invalid value for --cover-times: %d (must be >= 1)", coverTimes)
 	}
 
-	// Get the pubkey from the command-line argument
-	pubkeyInput := flag.Arg(0)
-	pubkeyHex, err := processHexPubkey(pubkeyInput)
-	if err != nil {
-		log.Fatalf("Invalid pubkey %s: %v", pubkeyInput, err)
+	var err error // Declare err once to avoid redeclaration
+
+	// Initialize list of pubkeys
+	var pubkeys []string
+
+	if pubkeysFile != "" {
+		// Read pubkeys from file
+		var filePubkeys []string
+		filePubkeys, err = readPubkeysFromFile(pubkeysFile)
+		if err != nil {
+			log.Fatalf("Error reading pubkeys from file: %v", err)
+		}
+		pubkeys = filePubkeys
+	} else if flag.NArg() >= 1 {
+		// Use pubkey(s) from command-line arguments
+		pubkeys = flag.Args()
+	} else {
+		log.Fatalf("No pubkeys provided. Use --pubkeys-file or provide a pubkey as an argument.")
+	}
+
+	// Validate and process the hex pubkeys
+	var validPubkeys []string
+	for _, pk := range pubkeys {
+		pubkeyHex, err := processHexPubkey(pk)
+		if err != nil {
+			log.Printf("Invalid pubkey %s: %v", pk, err)
+			continue
+		}
+		validPubkeys = append(validPubkeys, pubkeyHex)
+	}
+
+	if len(validPubkeys) == 0 {
+		log.Fatalf("No valid pubkeys provided.")
 	}
 
 	// Initialize default relays
@@ -73,10 +116,16 @@ func main() {
 		}
 	}
 
-	// Normalize the initial relays to remove trailing slashes
-	for i, relayURL := range initialRelays {
-		initialRelays[i] = normalizeRelayURL(relayURL)
+	// Normalize and validate the initial relays
+	initialRelays = filterRelays(initialRelays, ignoreNonTLS)
+	var validInitialRelays []string
+	for _, relayURL := range initialRelays {
+		normalizedRelay := normalizeRelayURL(relayURL)
+		if isValidRelayURL(normalizedRelay) {
+			validInitialRelays = append(validInitialRelays, normalizedRelay)
+		}
 	}
+	initialRelays = validInitialRelays
 
 	// Initialize ignore list of relays
 	var ignoreRelays []string
@@ -91,11 +140,14 @@ func main() {
 		ignoreRelays = []string{}
 	}
 
-	// Normalize the ignore relays
+	// Normalize and validate the ignore relays
 	normalizedIgnoreRelays := make(map[string]bool)
+	ignoreRelays = filterRelays(ignoreRelays, ignoreNonTLS)
 	for _, relay := range ignoreRelays {
 		normalizedRelay := normalizeRelayURL(relay)
-		normalizedIgnoreRelays[normalizedRelay] = true
+		if isValidRelayURL(normalizedRelay) {
+			normalizedIgnoreRelays[normalizedRelay] = true
+		}
 	}
 
 	// Create a context for the SimplePool
@@ -109,63 +161,81 @@ func main() {
 		relayPool.EnsureRelay(url)
 	}
 
-	// Fetch the kind 3 event (contact list) for the provided pubkey
-	follows, err := getFollowsFromKind3(ctx, relayPool, pubkeyHex, initialRelays)
+	// Fetch the kind 3 events (contact lists) for the provided pubkeys
+	fmt.Println("Fetching kind 3 events (contact lists) for the provided pubkeys...")
+	follows, err := getFollowsFromKind3Batch(ctx, relayPool, validPubkeys, initialRelays)
 	if err != nil {
-		log.Fatalf("Error fetching follows for pubkey %s: %v", pubkeyInput, err)
+		log.Fatalf("Error fetching follows: %v", err)
 	}
 
 	if len(follows) == 0 {
-		log.Fatalf("No follows found for pubkey %s", pubkeyInput)
+		log.Fatalf("No follows found for the provided pubkeys.")
 	}
 
-	// Use the extracted pubkeys
-	pubkeys := follows
+	// Use the collected follows as the pubkeys to process
+	followsPubkeys := follows
 
-	// Batch the pubkeys into groups of up to 100
-	batches := batchPubkeys(pubkeys, 100)
+	// Batch the follows pubkeys into groups of up to 100
+	batches := batchPubkeys(followsPubkeys, 100)
 
 	// Mapping from pubkey to list of relays
 	pubkeyRelays := make(map[string][]string)
 	var mu sync.Mutex
 
-	// Process each batch
+	// Fetch relays for the collected follows
+	fmt.Println("Fetching relays for the collected follows...")
+	totalBatches := len(batches)
+	bar := progressbar.Default(int64(totalBatches), "Fetching relays")
 	for _, batch := range batches {
 		// Validate and process the hex pubkeys in the batch
-		validPubkeys := []string{}
+		validBatchPubkeys := []string{}
 		for _, pk := range batch {
 			pubkeyHex, err := processHexPubkey(pk)
 			if err != nil {
 				log.Printf("Invalid pubkey %s: %v", pk, err)
 				continue
 			}
-			validPubkeys = append(validPubkeys, pubkeyHex)
+			validBatchPubkeys = append(validBatchPubkeys, pubkeyHex)
 		}
 
-		if len(validPubkeys) == 0 {
+		if len(validBatchPubkeys) == 0 {
+			bar.Add(1)
 			continue
 		}
 
 		// Get relays for the batch of pubkeys
-		relaysForBatch, err := getRelaysForPubkeys(ctx, relayPool, validPubkeys, initialRelays)
+		relaysForBatch, err := getRelaysForPubkeys(ctx, relayPool, validBatchPubkeys, initialRelays, ignoreNonTLS)
 		if err != nil {
 			log.Printf("Error getting relays for batch: %v", err)
+			bar.Add(1)
 			continue
 		}
 
 		// Merge the results into pubkeyRelays
 		mu.Lock()
 		for pk, relays := range relaysForBatch {
-			pubkeyRelays[pk] = relays
+			validRelays := []string{}
+			for _, relay := range relays {
+				if isValidRelayURL(relay) {
+					validRelays = append(validRelays, relay)
+				}
+			}
+			pubkeyRelays[pk] = validRelays
 		}
 		mu.Unlock()
+
+		bar.Add(1)
 	}
 
 	// Build mapping from relay to set of pubkeys, excluding ignored relays and optionally .onion domains
+	fmt.Println("Processing relay and pubkey mappings...")
 	relayPubkeys := make(map[string]map[string]bool)
 	for pk, relays := range pubkeyRelays {
 		for _, relay := range relays {
 			normalizedRelay := normalizeRelayURL(relay)
+			if !isValidRelayURL(normalizedRelay) {
+				continue // Skip invalid relay URLs
+			}
 			if normalizedIgnoreRelays[normalizedRelay] {
 				// Skip relays in the ignore list
 				continue
@@ -175,6 +245,13 @@ func main() {
 				parsedURL, err := url.Parse(normalizedRelay)
 				if err == nil && strings.HasSuffix(parsedURL.Hostname(), ".onion") {
 					// Skip .onion domains if ignoreOnion is true
+					continue
+				}
+			}
+			if ignoreNonTLS {
+				// Skip non-TLS relays if ignoreNonTLS is true
+				parsedURL, err := url.Parse(normalizedRelay)
+				if err == nil && parsedURL.Scheme != "wss" {
 					continue
 				}
 			}
@@ -191,13 +268,92 @@ func main() {
 		relayPopularity[relay] = len(pks)
 	}
 
-	// Apply greedy multi-cover set cover algorithm with relay popularity
-	minRelays := greedySetMultiCover(pubkeys, relayPubkeys, coverTimes, relayPopularity) // Pass relayPopularity
+	// Make a copy of relayPubkeys before passing to greedySetMultiCover
+	relayPubkeysCopy := copyRelayPubkeys(relayPubkeys)
 
-	fmt.Printf("Minimum set of public relays to subscribe to (each pubkey covered at least %d times):\n", coverTimes)
+	// Apply greedy multi-cover set cover algorithm with relay popularity
+	fmt.Println("Computing minimum set of relays using greedy algorithm...")
+	minRelays := greedySetMultiCover(followsPubkeys, relayPubkeys, coverTimes, relayPopularity) // Pass relayPopularity
+
+	// Prepare the relay information for sorting
+	relayInfos := []RelayInfo{}
 	for _, relay := range minRelays {
-		fmt.Println(relay)
+		pubkeysCovered := relayPubkeysCopy[relay]
+		numPubkeys := len(pubkeysCovered)
+		pubkeyList := []string{}
+		for pk := range pubkeysCovered {
+			pubkeyList = append(pubkeyList, pk)
+		}
+		relayInfos = append(relayInfos, RelayInfo{
+			Relay:      relay,
+			NumPubkeys: numPubkeys,
+			Pubkeys:    pubkeyList,
+		})
 	}
+
+	// Sort the relayInfos slice by NumPubkeys in descending order
+	sort.Slice(relayInfos, func(i, j int) bool {
+		return relayInfos[i].NumPubkeys > relayInfos[j].NumPubkeys
+	})
+
+	fmt.Printf("\nMinimum set of public relays to subscribe to (each pubkey covered at least %d times):\n", coverTimes)
+	for _, relayInfo := range relayInfos {
+		relay := relayInfo.Relay
+		numPubkeys := relayInfo.NumPubkeys
+		pubkeysCovered := relayInfo.Pubkeys
+
+		if verbose {
+			if numPubkeys == 1 {
+				npub, err := nip19.EncodePublicKey(pubkeysCovered[0])
+				if err != nil {
+					npub = pubkeysCovered[0]
+				}
+				fmt.Printf("%s (covers pubkey: %s)\n", relay, npub)
+			} else {
+				fmt.Printf("%s (covers %d pubkeys)\n", relay, numPubkeys)
+			}
+		} else {
+			fmt.Println(relay)
+		}
+	}
+}
+
+func copyRelayPubkeys(original map[string]map[string]bool) map[string]map[string]bool {
+	copy := make(map[string]map[string]bool)
+	for relay, pubkeys := range original {
+		pubkeysCopy := make(map[string]bool)
+		for pk := range pubkeys {
+			pubkeysCopy[pk] = true
+		}
+		copy[relay] = pubkeysCopy
+	}
+	return copy
+}
+
+func readPubkeysFromFile(filename string) ([]string, error) {
+	var pubkeys []string
+
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open pubkeys file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			// Skip empty lines and comments
+			continue
+		}
+		pubkeys = append(pubkeys, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading pubkeys file: %w", err)
+	}
+
+	return pubkeys, nil
 }
 
 func readRelaysFromFile(filename string) ([]string, error) {
@@ -224,6 +380,23 @@ func readRelaysFromFile(filename string) ([]string, error) {
 	}
 
 	return relays, nil
+}
+
+func filterRelays(relays []string, ignoreNonTLS bool) []string {
+	var filtered []string
+	for _, relay := range relays {
+		if ignoreNonTLS {
+			parsedURL, err := url.Parse(relay)
+			if err != nil {
+				continue // Skip invalid URLs
+			}
+			if parsedURL.Scheme != "wss" {
+				continue // Skip non-TLS relays
+			}
+		}
+		filtered = append(filtered, relay)
+	}
+	return filtered
 }
 
 func batchPubkeys(pubkeys []string, batchSize int) [][]string {
@@ -269,48 +442,95 @@ func normalizeRelayURL(relay string) string {
 	return parsedURL.String()
 }
 
-func getFollowsFromKind3(ctx context.Context, relayPool *nostr.SimplePool, pubkey string, initialRelays []string) ([]string, error) {
-	// Prepare the filter to get kind 3 events for the pubkey
-	filter := nostr.Filter{
-		Authors: []string{pubkey},
-		Kinds:   []int{3},
-		Limit:   1,
+func isValidRelayURL(relay string) bool {
+	parsedURL, err := url.Parse(relay)
+	if err != nil {
+		return false
 	}
-
-	// Create a context with timeout for this subscription
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	// Use SubManyEose to subscribe to multiple relays
-	events := relayPool.SubManyEose(timeoutCtx, initialRelays, []nostr.Filter{filter})
-
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				// Channel closed
-				return nil, fmt.Errorf("No kind 3 event found for pubkey %s", pubkey)
-			}
-			if ev.Event == nil {
-				continue
-			}
-			// Extract pubkeys from 'p' tags
-			var follows []string
-			for _, tag := range ev.Event.Tags {
-				if tag[0] == "p" && len(tag) > 1 {
-					pk := tag[1]
-					follows = append(follows, pk)
-				}
-			}
-			return follows, nil
-		case <-timeoutCtx.Done():
-			// Timeout reached
-			return nil, fmt.Errorf("Timeout fetching kind 3 event for pubkey %s", pubkey)
-		}
+	if parsedURL.Scheme != "ws" && parsedURL.Scheme != "wss" {
+		return false
 	}
+	if parsedURL.Host == "" {
+		return false
+	}
+	return true
 }
 
-func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubkeys []string, initialRelays []string) (map[string][]string, error) {
+func getFollowsFromKind3Batch(ctx context.Context, relayPool *nostr.SimplePool, pubkeys []string, initialRelays []string) ([]string, error) {
+	// Map to store the latest event per pubkey
+	latestEvents := make(map[string]*nostr.Event)
+	var mu sync.Mutex
+
+	// Batch the pubkeys into groups of up to 20
+	batches := batchPubkeys(pubkeys, 20)
+
+	totalBatches := len(batches)
+	bar := progressbar.Default(int64(totalBatches), "Fetching kind 3 events")
+
+	for _, batch := range batches {
+		// Prepare the filter to get kind 3 events for the pubkeys
+		filter := nostr.Filter{
+			Authors: batch,
+			Kinds:   []int{3},
+		}
+
+		// Create a context with timeout for this subscription
+		timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		// Use SubManyEose to subscribe to multiple relays
+		events := relayPool.SubManyEose(timeoutCtx, initialRelays, []nostr.Filter{filter})
+
+	OuterLoop:
+		for {
+			select {
+			case ev, ok := <-events:
+				if !ok {
+					// Channel closed
+					break OuterLoop
+				}
+				if ev.Event == nil {
+					continue
+				}
+				pubkey := ev.Event.PubKey
+
+				mu.Lock()
+				existingEvent, exists := latestEvents[pubkey]
+				if !exists || ev.Event.CreatedAt > existingEvent.CreatedAt {
+					// Update the latest event for this pubkey
+					latestEvents[pubkey] = ev.Event
+				}
+				mu.Unlock()
+			case <-timeoutCtx.Done():
+				// Timeout reached
+				break OuterLoop
+			}
+		}
+
+		bar.Add(1)
+	}
+
+	// Now extract follows from the latest events
+	followsSet := make(map[string]struct{})
+	for _, event := range latestEvents {
+		for _, tag := range event.Tags {
+			if tag[0] == "p" && len(tag) > 1 {
+				pk := tag[1]
+				followsSet[pk] = struct{}{}
+			}
+		}
+	}
+
+	// Convert set to slice
+	var follows []string
+	for pk := range followsSet {
+		follows = append(follows, pk)
+	}
+
+	return follows, nil
+}
+
+func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubkeys []string, initialRelays []string, ignoreNonTLS bool) (map[string][]string, error) {
 	// Prepare the filter
 	filter := nostr.Filter{
 		Authors: pubkeys,
@@ -326,6 +546,7 @@ func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubke
 
 	// Map to collect relay URLs for each pubkey
 	pubkeyToRelays := make(map[string][]string)
+	latestEventTime := make(map[string]nostr.Timestamp)
 
 	// Set to keep track of pubkeys we are waiting for
 	pendingPubkeys := make(map[string]struct{})
@@ -333,12 +554,13 @@ func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubke
 		pendingPubkeys[pk] = struct{}{}
 	}
 
+OuterLoop:
 	for {
 		select {
 		case ev, ok := <-events:
 			if !ok {
 				// Channel closed
-				return pubkeyToRelays, nil
+				break OuterLoop
 			}
 			if ev.Event == nil {
 				continue
@@ -346,36 +568,53 @@ func getRelaysForPubkeys(ctx context.Context, relayPool *nostr.SimplePool, pubke
 
 			pk := ev.Event.PubKey
 
-			if _, ok := pendingPubkeys[pk]; !ok {
-				// Either we already received an event for this pubkey, or it's not in our list
-				continue
-			}
-
-			// Extract relay URLs from 'r' tags
-			var relayURLs []string
-			for _, tag := range ev.Event.Tags {
-				if tag[0] == "r" && len(tag) > 1 {
-					normalizedRelay := normalizeRelayURL(tag[1])
-					// Avoid duplicates
-					if !contains(relayURLs, normalizedRelay) {
-						relayURLs = append(relayURLs, normalizedRelay)
+			// Since we might receive multiple events per pubkey, keep the latest one
+			mu := sync.Mutex{}
+			mu.Lock()
+			existingTime, exists := latestEventTime[pk]
+			if !exists || ev.Event.CreatedAt > existingTime {
+				// Extract relay URLs from 'r' tags
+				var relayURLs []string
+				for _, tag := range ev.Event.Tags {
+					if tag[0] == "r" && len(tag) > 1 {
+						normalizedRelay := normalizeRelayURL(tag[1])
+						if ignoreNonTLS {
+							parsedURL, err := url.Parse(normalizedRelay)
+							if err != nil {
+								continue // Skip invalid URLs
+							}
+							if parsedURL.Scheme != "wss" {
+								continue // Skip non-TLS relays
+							}
+						}
+						if !isValidRelayURL(normalizedRelay) {
+							continue // Skip invalid relay URLs
+						}
+						// Avoid duplicates
+						if !contains(relayURLs, normalizedRelay) {
+							relayURLs = append(relayURLs, normalizedRelay)
+						}
 					}
 				}
+				pubkeyToRelays[pk] = relayURLs
+				latestEventTime[pk] = ev.Event.CreatedAt
 			}
+			mu.Unlock()
 
-			pubkeyToRelays[pk] = relayURLs
 			delete(pendingPubkeys, pk)
 
 			// If we have received events for all pubkeys, we can return
 			if len(pendingPubkeys) == 0 {
-				return pubkeyToRelays, nil
+				break OuterLoop
 			}
 
 		case <-timeoutCtx.Done():
 			// Timeout reached
-			return pubkeyToRelays, nil
+			break OuterLoop
 		}
 	}
+
+	return pubkeyToRelays, nil
 }
 
 func contains(slice []string, item string) bool {
